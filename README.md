@@ -4,6 +4,8 @@
 
 LLMs generate raw WebAssembly binary directly — no intermediate code, no JSON patches. The WASM module executes against host-imported functions to build a UI spec that React, React Native, or Remotion renders.
 
+> **Note:** The npm packages are published under the `@json-render` scope. The project was rebranded to `wasm-render` but the package names remain `@json-render/*` for backwards compatibility.
+
 ```bash
 npm install @json-render/core @json-render/react
 # or for mobile
