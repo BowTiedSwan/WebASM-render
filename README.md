@@ -1,8 +1,8 @@
-# json-render
+# wasm-render
 
-**The framework for User-Generated Interfaces (UGI).**
+**The framework for User-Generated Interfaces (UGI) via WebAssembly bytecode.**
 
-Dynamic, personalized UIs per user without sacrificing reliability. Predefined components and actions for safe, predictable output.
+LLMs generate raw WebAssembly binary directly — no intermediate code, no JSON patches. The WASM module executes against host-imported functions to build a UI spec that React, React Native, or Remotion renders.
 
 ```bash
 npm install @json-render/core @json-render/react
@@ -12,14 +12,37 @@ npm install @json-render/core @json-render/react-native
 npm install @json-render/core @json-render/remotion
 ```
 
-## Why json-render?
+## Why wasm-render?
 
-json-render enables **User-Generated Interfaces**: dynamic UIs that end users create through natural language prompts, powered by Generative UI. You define the guardrails, AI generates within them:
+wasm-render enables **User-Generated Interfaces**: dynamic UIs that end users create through natural language prompts, powered by Generative UI. Instead of generating JSON text, the LLM outputs WebAssembly bytecode (hex-encoded) that compiles and executes on the client to produce the UI specification.
 
-- **Guardrailed** - AI can only use components in your catalog
-- **Predictable** - JSON output matches your schema, every time
-- **Fast** - Stream and render progressively as the model responds
-- **Cross-Platform** - React (web) and React Native (mobile) from the same catalog
+- **Binary-native** — LLM generates WASM bytecode directly, no parsing or validation of text formats
+- **Guardrailed** — WASM modules can only call host-imported ABI functions from your catalog
+- **Predictable** — The ABI enforces a well-typed spec; invalid calls are caught at execution time
+- **Fast** — Stream hex-encoded bytes progressively as the model responds, compile once at the end
+- **Cross-Platform** — React (web) and React Native (mobile) from the same catalog
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A[User Prompt] --> B[LLM + ABI Reference]
+    B --> C[Hex-encoded WASM Binary]
+    C --> D[Compile & Execute]
+    D --> E[UI Spec]
+    E --> F[Renderer]
+
+    B -.- G([guardrailed])
+    C -.- H([binary])
+    D -.- I([sandboxed])
+    F -.- J([streamed])
+```
+
+1. **Define the guardrails** — what components, actions, and data bindings the AI can use
+2. **Users generate** — end users describe what they want in natural language
+3. **LLM emits WASM bytecode** — hex-encoded binary streamed to the client
+4. **Client compiles & executes** — the WASM module calls host ABI functions (e.g. `create_element`, `set_prop_str`) to build a UI spec
+5. **Render** — React/RN/Remotion renders the spec, same as before
 
 ## Quick Start
 
@@ -87,26 +110,129 @@ const { registry } = defineRegistry(catalog, {
 });
 ```
 
-### 3. Render AI-Generated Specs
+### 3. Stream WASM & Render
 
 ```tsx
-function Dashboard({ spec }) {
-  return <Renderer spec={spec} registry={registry} />;
+import { useWasmStream } from "@json-render/react";
+
+function Dashboard() {
+  const { spec, isStreaming, bytesReceived, send } = useWasmStream({
+    api: "/api/generate-wasm",
+  });
+
+  return (
+    <div>
+      <button onClick={() => send("Show me a sales dashboard")}>
+        Generate UI
+      </button>
+      {isStreaming && <p>Receiving WASM bytecode... {bytesReceived} bytes</p>}
+      {spec && <Renderer spec={spec} registry={registry} />}
+    </div>
+  );
 }
 ```
 
-**That's it.** AI generates JSON, you render it safely.
+**That's it.** The LLM generates a WASM binary, the client executes it, and you render the resulting spec.
 
 ---
+
+## WASM ABI
+
+The LLM-generated WASM module imports 14 host functions under the `"env"` module that build a UI spec:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `set_root` | `(ptr, len)` | Set the root element key |
+| `create_element` | `(id_ptr, id_len, type_ptr, type_len)` | Create an element with a type |
+| `set_prop_str` | `(el_ptr, el_len, k_ptr, k_len, v_ptr, v_len)` | Set a string prop |
+| `set_prop_int` | `(el_ptr, el_len, k_ptr, k_len, value)` | Set an integer prop |
+| `set_prop_bool` | `(el_ptr, el_len, k_ptr, k_len, value)` | Set a boolean prop (0/1) |
+| `set_prop_json` | `(el_ptr, el_len, k_ptr, k_len, v_ptr, v_len)` | Set a JSON-parsed prop |
+| `set_state_path_prop` | `(el_ptr, el_len, k_ptr, k_len, path_ptr, path_len)` | Set a `$path` dynamic prop |
+| `add_child` | `(parent_ptr, parent_len, child_ptr, child_len)` | Add child to element |
+| `set_state_str` | `(key_ptr, key_len, val_ptr, val_len)` | Set string state |
+| `set_state_int` | `(key_ptr, key_len, value)` | Set integer state |
+| `set_state_json` | `(key_ptr, key_len, val_ptr, val_len)` | Set JSON state value |
+| `set_visible_path` | `(el_ptr, el_len, path_ptr, path_len)` | Set visibility condition |
+| `set_event` | `(el_ptr, el_len, ev_ptr, ev_len, act_ptr, act_len, params_ptr, params_len)` | Bind event handler |
+| `set_repeat` | `(el_ptr, el_len, path_ptr, path_len, key_ptr, key_len)` | Set repeat/list binding |
+
+All string arguments are passed as `(pointer, length)` pairs into WASM linear memory. Strings are stored in a Data section at known offsets.
 
 ## Packages
 
 | Package | Description |
 |---------|-------------|
-| `@json-render/core` | Schemas, catalogs, AI prompts, dynamic props, SpecStream utilities |
-| `@json-render/react` | React renderer, contexts, hooks |
+| `@json-render/core` | Catalogs, AI prompts, WASM bytecode builder, runtime, stream compiler |
+| `@json-render/react` | React renderer, contexts, hooks (`useWasmStream`, `useUIStream`) |
 | `@json-render/react-native` | React Native renderer with standard mobile components |
 | `@json-render/remotion` | Remotion video renderer, timeline schema |
+
+## Core Modules
+
+### WASM Bytecode Builder (`wasm-bytecode.ts`)
+
+Programmatic construction of valid WASM binaries:
+
+```typescript
+import { buildWasmModule, buildStringTable, i32Const, call } from "@json-render/core";
+
+const strings = ["root", "Card", "title", "Hello"];
+const { entries, segment } = buildStringTable(strings, 1024);
+
+const binary = buildWasmModule({
+  types: [{ params: ["i32", "i32"], results: [] }],
+  imports: [{ module: "env", name: "set_root", typeIndex: 0 }],
+  functions: [{ typeIndex: 0, locals: [], body: [...i32Const(entries[0].offset), ...i32Const(entries[0].length), ...call(0)] }],
+  memories: [{ initial: 1 }],
+  exports: [{ name: "memory", kind: "memory", index: 0 }, { name: "render", kind: "func", index: 1 }],
+  dataSegments: [segment],
+});
+```
+
+### WASM Runtime (`wasm-runtime.ts`)
+
+Execute WASM modules against host-imported ABI functions:
+
+```typescript
+import { executeWasmModule } from "@json-render/core";
+
+const result = await executeWasmModule(wasmBinary);
+// result.spec — the generated UI specification
+// result.errors — any runtime errors
+```
+
+### WASM Stream Compiler (`wasm-stream.ts`)
+
+Accumulate hex-encoded WASM bytes from an LLM stream:
+
+```typescript
+import { createWasmStreamCompiler } from "@json-render/core";
+
+const compiler = createWasmStreamCompiler();
+
+for await (const chunk of stream) {
+  const state = compiler.push(chunk);
+  console.log(`${state.bytesReceived} bytes received`);
+}
+
+const result = await compiler.finalize();
+if (result.spec) renderUI(result.spec);
+```
+
+### WASM Prompt Builder (`wasm-prompt.ts`)
+
+Generate system prompts that teach the LLM how to emit valid WASM bytecode:
+
+```typescript
+import { buildWasmSystemPrompt } from "@json-render/core";
+
+const systemPrompt = buildWasmSystemPrompt(catalog, {
+  system: "You are a UI generator that outputs WebAssembly bytecode directly.",
+});
+```
+
+The prompt includes the full ABI reference, WASM binary format specification, LEB128 encoding rules, and a complete worked example.
 
 ## Renderers
 
@@ -116,18 +242,6 @@ function Dashboard({ spec }) {
 import { defineRegistry, Renderer } from "@json-render/react";
 import { schema } from "@json-render/react";
 
-// Element tree spec format
-const spec = {
-  root: {
-    type: "Card",
-    props: { title: "Hello" },
-    children: [
-      { type: "Button", props: { label: "Click me" } }
-    ]
-  }
-};
-
-// defineRegistry creates a type-safe component registry
 const { registry } = defineRegistry(catalog, { components });
 <Renderer spec={spec} registry={registry} />
 ```
@@ -143,7 +257,6 @@ import {
 } from "@json-render/react-native/catalog";
 import { defineRegistry, Renderer } from "@json-render/react-native";
 
-// 25+ standard components included
 const catalog = defineCatalog(schema, {
   components: { ...standardComponentDefinitions },
   actions: standardActionDefinitions,
@@ -159,7 +272,6 @@ const { registry } = defineRegistry(catalog, { components: {} });
 import { Player } from "@remotion/player";
 import { Renderer, schema, standardComponentDefinitions } from "@json-render/remotion";
 
-// Timeline spec format
 const spec = {
   composition: { id: "video", fps: 30, width: 1920, height: 1080, durationInFrames: 300 },
   tracks: [{ id: "main", name: "Main", type: "video", enabled: true }],
@@ -181,32 +293,6 @@ const spec = {
 
 ## Features
 
-### Streaming (SpecStream)
-
-Stream AI responses progressively:
-
-```typescript
-import { createSpecStreamCompiler } from "@json-render/core";
-
-const compiler = createSpecStreamCompiler<MySpec>();
-
-// Process chunks as they arrive
-const { result, newPatches } = compiler.push(chunk);
-setSpec(result); // Update UI with partial result
-
-// Get final result
-const finalSpec = compiler.getResult();
-```
-
-### AI Prompt Generation
-
-Generate system prompts from your catalog:
-
-```typescript
-const systemPrompt = catalog.prompt();
-// Includes component descriptions, props schemas, available actions
-```
-
 ### Conditional Visibility
 
 ```json
@@ -226,20 +312,8 @@ const systemPrompt = catalog.prompt();
 
 Any prop value can be data-driven using expressions:
 
-```json
-{
-  "type": "Icon",
-  "props": {
-    "name": { "$cond": { "eq": [{ "path": "/activeTab" }, "home"] }, "$then": "home", "$else": "home-outline" },
-    "color": { "$cond": { "eq": [{ "path": "/activeTab" }, "home"] }, "$then": "#007AFF", "$else": "#8E8E93" }
-  }
-}
-```
-
-Two expression forms:
-
-- **`{ "$path": "/state/key" }`** - reads a value from the data model
-- **`{ "$cond": <condition>, "$then": <value>, "$else": <value> }`** - evaluates a condition (same syntax as visibility conditions) and picks a branch
+- **`{ "$path": "/state/key" }`** — reads a value from the data model
+- **`{ "$cond": <condition>, "$then": <value>, "$else": <value> }`** — evaluates a condition and picks a branch
 
 ### Actions
 
@@ -253,41 +327,33 @@ Components can trigger actions, including the built-in `setState` action:
 }
 ```
 
-The `setState` action updates the state model directly, which re-evaluates visibility conditions and dynamic prop expressions.
+### Legacy JSON Streaming (SpecStream)
+
+The original JSON patch streaming mode is still supported alongside WASM:
+
+```typescript
+import { createSpecStreamCompiler } from "@json-render/core";
+import { useUIStream } from "@json-render/react";
+
+const compiler = createSpecStreamCompiler<MySpec>();
+const { result, newPatches } = compiler.push(chunk);
+```
 
 ---
 
 ## Demo
 
 ```bash
-git clone https://github.com/vercel-labs/json-render
+git clone https://github.com/AkaSomix/json-render
 cd json-render
 pnpm install
 pnpm dev
 ```
 
-- http://localhost:3000 - Docs & Playground
-- http://localhost:3001 - Example Dashboard
-- http://localhost:3002 - Remotion Video Example
+- http://localhost:3000 — Docs & Playground (with JSON/WASM mode toggle)
+- http://localhost:3001 — Example Dashboard
+- http://localhost:3002 — Remotion Video Example
 - React Native example: run `npx expo start` in `examples/react-native`
-
-## How It Works
-
-```mermaid
-flowchart LR
-    A[User Prompt] --> B[AI + Catalog]
-    B --> C[JSON Spec]
-    C --> D[Renderer]
-    
-    B -.- E([guardrailed])
-    C -.- F([predictable])
-    D -.- G([streamed])
-```
-
-1. **Define the guardrails** - what components, actions, and data bindings AI can use
-2. **Users generate** - end users describe what they want in natural language
-3. **AI generates JSON** - output is always predictable, constrained to your catalog
-4. **Render fast** - stream and render progressively as the model responds
 
 ## License
 
