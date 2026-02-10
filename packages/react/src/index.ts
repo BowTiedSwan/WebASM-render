@@ -96,3 +96,11 @@ export {
   type UseUIStreamReturn,
   type TokenUsage,
 } from "./hooks";
+
+// WASM Hooks
+export {
+  useWasmStream,
+  type UseWasmStreamOptions,
+  type UseWasmStreamReturn,
+  type WasmUsage,
+} from "./hooks-wasm";

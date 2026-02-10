@@ -155,3 +155,54 @@ export {
   generateCatalogPrompt,
   generateSystemPrompt,
 } from "./catalog";
+
+// WASM Bytecode Generation
+export type {
+  FuncType,
+  ImportFunc,
+  ExportFunc,
+  DataSegment,
+  FuncBody,
+  WasmModuleOptions,
+  StringEntry,
+} from "./wasm-bytecode";
+
+export {
+  encodeULEB128,
+  encodeSLEB128,
+  WASM_TYPE,
+  OP,
+  buildWasmModule,
+  buildStringTable,
+  toHex,
+  fromHex,
+  i32Const,
+  call,
+  localGet,
+  localSet,
+} from "./wasm-bytecode";
+
+// WASM Runtime
+export type { WasmExecResult } from "./wasm-runtime";
+
+export { createWasmImports, executeWasmModule } from "./wasm-runtime";
+
+// WASM Stream
+export type {
+  WasmTokenUsage,
+  WasmStreamResult,
+  WasmStreamCompiler,
+} from "./wasm-stream";
+
+export {
+  createWasmStreamCompiler,
+  compileWasmHex,
+  formatWasmHexDump,
+} from "./wasm-stream";
+
+// WASM Prompt
+export {
+  buildWasmSystemPrompt,
+  buildWasmUserPrompt,
+  getWasmReferenceExample,
+} from "./wasm-prompt";

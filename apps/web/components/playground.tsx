@@ -2,7 +2,11 @@
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { flushSync } from "react-dom";
-import { useUIStream, type TokenUsage } from "@json-render/react";
+import {
+  useUIStream,
+  useWasmStream,
+  type TokenUsage,
+} from "@json-render/react";
 import type { Spec } from "@json-render/core";
 import { collectUsedComponents, serializeProps } from "@json-render/codegen";
 import { toast } from "sonner";
@@ -19,12 +23,14 @@ import { Sheet, SheetContent, SheetTitle } from "./ui/sheet";
 import { PlaygroundRenderer } from "@/lib/render/renderer";
 import { playgroundCatalog } from "@/lib/render/catalog";
 
-type Tab = "json" | "nested" | "stream" | "catalog";
+type GenerationMode = "json" | "wasm";
+type Tab = "json" | "nested" | "stream" | "wasm" | "catalog";
 type RenderView = "preview" | "code";
 type MobileView =
   | "json"
   | "nested"
   | "stream"
+  | "wasm"
   | "catalog"
   | "preview"
   | "generated-code";
@@ -36,6 +42,9 @@ interface Version {
   status: "generating" | "complete" | "error";
   usage: TokenUsage | null;
   rawLines: string[];
+  mode: GenerationMode;
+  hexDump?: string;
+  wasmErrors?: string[];
 }
 
 /**
@@ -96,6 +105,7 @@ export function Playground() {
     null,
   );
   const [inputValue, setInputValue] = useState("");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("json");
   const [activeTab, setActiveTab] = useState<Tab>("json");
   const [catalogSection, setCatalogSection] = useState<
     "components" | "actions"
@@ -115,17 +125,16 @@ export function Playground() {
 
   const {
     spec: apiSpec,
-    isStreaming,
+    isStreaming: isJsonStreaming,
     usage: streamUsage,
     rawLines: streamRawLines,
-    send,
-    clear,
+    send: jsonSend,
+    clear: jsonClear,
   } = useUIStream({
     api: "/api/generate",
     onError: (err: Error) => {
       console.error("Generation error:", err);
       toast.error(err.message || "Generation failed. Please try again.");
-      // Mark the version as errored
       if (generatingVersionIdRef.current) {
         const erroredVersionId = generatingVersionIdRef.current;
         setVersions((prev) =>
@@ -138,27 +147,73 @@ export function Playground() {
     },
   } as Parameters<typeof useUIStream>[0]);
 
+  const {
+    spec: wasmSpec,
+    isStreaming: isWasmStreaming,
+    usage: wasmUsage,
+    bytesReceived: wasmBytesReceived,
+    hexDump: wasmHexDump,
+    wasmErrors,
+    send: wasmSend,
+    clear: wasmClear,
+  } = useWasmStream({
+    api: "/api/generate-wasm",
+    onError: (err: Error) => {
+      console.error("WASM generation error:", err);
+      toast.error(err.message || "WASM generation failed. Please try again.");
+      if (generatingVersionIdRef.current) {
+        const erroredVersionId = generatingVersionIdRef.current;
+        setVersions((prev) =>
+          prev.map((v) =>
+            v.id === erroredVersionId ? { ...v, status: "error" as const } : v,
+          ),
+        );
+        generatingVersionIdRef.current = null;
+      }
+    },
+  });
+
+  // Unified streaming state
+  const isStreaming = isJsonStreaming || isWasmStreaming;
+  const clear = useCallback(() => {
+    jsonClear();
+    wasmClear();
+  }, [jsonClear, wasmClear]);
+
   // Get the selected version
   const selectedVersion = versions.find((v) => v.id === selectedVersionId);
 
   // Determine which tree to display:
-  // - If streaming and selected version is the generating one, show apiSpec
+  // - If streaming and selected version is the generating one, show apiSpec/wasmSpec
   // - Otherwise show the selected version's tree
   const isSelectedVersionGenerating =
     selectedVersionId === generatingVersionIdRef.current && isStreaming;
   const hasValidApiTree =
     apiSpec && apiSpec.root && Object.keys(apiSpec.elements).length > 0;
+  const hasValidWasmTree =
+    wasmSpec && wasmSpec.root && Object.keys(wasmSpec.elements).length > 0;
 
-  const currentTree =
-    isSelectedVersionGenerating && hasValidApiTree
-      ? apiSpec
-      : (selectedVersion?.tree ??
-        (isSelectedVersionGenerating ? apiSpec : null));
+  const currentTree = isSelectedVersionGenerating
+    ? hasValidWasmTree
+      ? wasmSpec
+      : hasValidApiTree
+        ? apiSpec
+        : (selectedVersion?.tree ?? apiSpec)
+    : (selectedVersion?.tree ??
+      (hasValidWasmTree ? wasmSpec : hasValidApiTree ? apiSpec : null));
 
   // Raw JSONL lines: live from stream during generation, or stored per version
   const currentRawLines = isSelectedVersionGenerating
     ? streamRawLines
     : (selectedVersion?.rawLines ?? []);
+
+  // WASM hex dump: live during generation, or stored per version
+  const currentHexDump = isSelectedVersionGenerating
+    ? wasmHexDump
+    : (selectedVersion?.hexDump ?? "");
+
+  // Current version's mode
+  const currentVersionMode = selectedVersion?.mode ?? generationMode;
 
   // Keep the ref updated with the current tree for use in handleSubmit
   if (
@@ -174,17 +229,19 @@ export function Playground() {
     versionsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [versions]);
 
-  // Update version when streaming completes
+  // Update version when JSON streaming completes
   useEffect(() => {
     if (
-      !isStreaming &&
+      !isJsonStreaming &&
       apiSpec &&
       apiSpec.root &&
       generatingVersionIdRef.current
     ) {
       const completedVersionId = generatingVersionIdRef.current;
-      setVersions((prev) =>
-        prev.map((v) =>
+      setVersions((prev) => {
+        const version = prev.find((v) => v.id === completedVersionId);
+        if (version?.mode !== "json") return prev;
+        return prev.map((v) =>
           v.id === completedVersionId
             ? {
                 ...v,
@@ -194,11 +251,46 @@ export function Playground() {
                 rawLines: streamRawLines,
               }
             : v,
-        ),
-      );
+        );
+      });
       generatingVersionIdRef.current = null;
     }
-  }, [isStreaming, apiSpec, streamUsage, streamRawLines]);
+  }, [isJsonStreaming, apiSpec, streamUsage, streamRawLines]);
+
+  // Update version when WASM streaming completes
+  useEffect(() => {
+    if (
+      !isWasmStreaming &&
+      wasmSpec &&
+      wasmSpec.root &&
+      generatingVersionIdRef.current
+    ) {
+      const completedVersionId = generatingVersionIdRef.current;
+      setVersions((prev) => {
+        const version = prev.find((v) => v.id === completedVersionId);
+        if (version?.mode !== "wasm") return prev;
+        return prev.map((v) =>
+          v.id === completedVersionId
+            ? {
+                ...v,
+                tree: wasmSpec,
+                status: "complete" as const,
+                usage: wasmUsage
+                  ? {
+                      promptTokens: wasmUsage.promptTokens,
+                      completionTokens: wasmUsage.completionTokens,
+                      totalTokens: wasmUsage.totalTokens,
+                    }
+                  : null,
+                hexDump: wasmHexDump,
+                wasmErrors: wasmErrors.length > 0 ? wasmErrors : undefined,
+              }
+            : v,
+        );
+      });
+      generatingVersionIdRef.current = null;
+    }
+  }, [isWasmStreaming, wasmSpec, wasmUsage, wasmHexDump, wasmErrors]);
 
   const handleSubmit = useCallback(async () => {
     if (!inputValue.trim() || isStreaming) return;
@@ -211,6 +303,7 @@ export function Playground() {
       status: "generating",
       usage: null,
       rawLines: [],
+      mode: generationMode,
     };
 
     generatingVersionIdRef.current = newVersionId;
@@ -218,9 +311,16 @@ export function Playground() {
     setSelectedVersionId(newVersionId);
     setInputValue("");
 
-    // Pass the current tree as context so the API can iterate on it
-    await send(inputValue.trim(), { previousSpec: currentTreeRef.current });
-  }, [inputValue, isStreaming, send]);
+    if (generationMode === "wasm") {
+      // WASM mode: generate binary bytecode
+      await wasmSend(inputValue.trim());
+    } else {
+      // JSON mode: generate JSON patches (original behavior)
+      await jsonSend(inputValue.trim(), {
+        previousSpec: currentTreeRef.current,
+      });
+    }
+  }, [inputValue, isStreaming, generationMode, jsonSend, wasmSend]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -364,6 +464,11 @@ ${jsx}
                   v{index + 1}
                 </span>
                 <span className="truncate flex-1">{version.prompt}</span>
+                {version.mode === "wasm" && (
+                  <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 shrink-0">
+                    wasm
+                  </span>
+                )}
                 {version.status === "generating" && (
                   <span className="text-xs text-muted-foreground shrink-0 animate-pulse">
                     ...
@@ -407,20 +512,37 @@ ${jsx}
           autoFocus
         />
         <div className="flex justify-between items-center mt-2">
-          {versions.length > 0 ? (
+          <div className="flex items-center gap-2">
+            {versions.length > 0 && (
+              <button
+                onClick={() => {
+                  setVersions([]);
+                  setSelectedVersionId(null);
+                  clear();
+                }}
+                className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Clear
+              </button>
+            )}
             <button
-              onClick={() => {
-                setVersions([]);
-                setSelectedVersionId(null);
-                clear();
-              }}
-              className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+              onClick={() =>
+                setGenerationMode(generationMode === "json" ? "wasm" : "json")
+              }
+              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                generationMode === "wasm"
+                  ? "border-green-500/50 bg-green-500/10 text-green-600 dark:text-green-400"
+                  : "border-border text-muted-foreground hover:text-foreground"
+              }`}
+              title={
+                generationMode === "wasm"
+                  ? "WASM bytecode mode: LLM generates binary directly"
+                  : "JSON mode: LLM generates JSON patches"
+              }
             >
-              Clear
+              {generationMode === "wasm" ? "wasm" : "json"}
             </button>
-          ) : (
-            <div />
-          )}
+          </div>
           {isStreaming ? (
             <button
               onClick={() => clear()}
@@ -552,28 +674,32 @@ ${jsx}
   const copyText =
     activeTab === "stream"
       ? currentRawLines.join("\n")
-      : activeTab === "json"
-        ? jsonCode
-        : activeTab === "nested"
-          ? nestedCode
-          : "";
+      : activeTab === "wasm"
+        ? currentHexDump
+        : activeTab === "json"
+          ? jsonCode
+          : activeTab === "nested"
+            ? nestedCode
+            : "";
 
   const codePane = (
     <div className="h-full flex flex-col border-t border-border">
       <div className="border-b border-border px-3 h-9 flex items-center gap-3">
-        {(["json", "nested", "stream", "catalog"] as const).map((tab) => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={`text-xs font-mono transition-colors ${
-              activeTab === tab
-                ? "text-foreground"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {tab}
-          </button>
-        ))}
+        {(["json", "nested", "stream", "wasm", "catalog"] as const).map(
+          (tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`text-xs font-mono transition-colors ${
+                activeTab === tab
+                  ? "text-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {tab}
+            </button>
+          ),
+        )}
         <div className="flex-1" />
         {activeTab !== "catalog" && (
           <CopyButton text={copyText} className="text-muted-foreground" />
@@ -697,6 +823,35 @@ ${jsx}
               )}
             </div>
           </div>
+        ) : activeTab === "wasm" ? (
+          currentHexDump ? (
+            <div className="p-3 font-mono text-xs leading-relaxed">
+              <div className="mb-2 text-muted-foreground">
+                {isWasmStreaming
+                  ? `Streaming WASM bytecode... ${wasmBytesReceived} bytes received`
+                  : `WASM module: ${Math.floor(currentHexDump.length / 2)} bytes`}
+                {selectedVersion?.wasmErrors &&
+                  selectedVersion.wasmErrors.length > 0 && (
+                    <span className="text-red-500 ml-2">
+                      ({selectedVersion.wasmErrors.length} error
+                      {selectedVersion.wasmErrors.length > 1 ? "s" : ""})
+                    </span>
+                  )}
+              </div>
+              <CodeBlock
+                code={currentHexDump.replace(/(.{64})/g, "$1\n").trim()}
+                lang="typescript"
+                fillHeight
+                hideCopyButton
+              />
+            </div>
+          ) : (
+            <div className="text-muted-foreground/50 p-3 text-sm font-mono">
+              {isWasmStreaming
+                ? "streaming wasm bytecode..."
+                : "// switch to wasm mode and generate to see bytecode"}
+            </div>
+          )
         ) : activeTab === "stream" ? (
           currentRawLines.length > 0 ? (
             <CodeBlock
@@ -812,19 +967,21 @@ ${jsx}
               : 0}
           </button>
           {/* Code tabs */}
-          {(["json", "nested", "stream", "catalog"] as const).map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setMobileView(tab)}
-              className={`text-xs font-mono transition-colors shrink-0 ${
-                mobileView === tab
-                  ? "text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {tab}
-            </button>
-          ))}
+          {(["json", "nested", "stream", "wasm", "catalog"] as const).map(
+            (tab) => (
+              <button
+                key={tab}
+                onClick={() => setMobileView(tab)}
+                className={`text-xs font-mono transition-colors shrink-0 ${
+                  mobileView === tab
+                    ? "text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {tab}
+              </button>
+            ),
+          )}
           <div className="flex-1" />
           {/* Preview / code toggle */}
           {[
@@ -964,6 +1121,28 @@ ${jsx}
                 )}
               </div>
             </div>
+          ) : mobileView === "wasm" ? (
+            currentHexDump ? (
+              <div className="p-3 font-mono text-xs leading-relaxed">
+                <div className="mb-2 text-muted-foreground">
+                  {isWasmStreaming
+                    ? `Streaming WASM bytecode... ${wasmBytesReceived} bytes`
+                    : `WASM module: ${Math.floor(currentHexDump.length / 2)} bytes`}
+                </div>
+                <CodeBlock
+                  code={currentHexDump.replace(/(.{64})/g, "$1\n").trim()}
+                  lang="typescript"
+                  fillHeight
+                  hideCopyButton
+                />
+              </div>
+            ) : (
+              <div className="text-muted-foreground/50 p-3 text-sm font-mono">
+                {isWasmStreaming
+                  ? "streaming wasm bytecode..."
+                  : "// switch to wasm mode to see bytecode"}
+              </div>
+            )
           ) : mobileView === "stream" ? (
             currentRawLines.length > 0 ? (
               <CodeBlock
@@ -1061,20 +1240,35 @@ ${jsx}
             rows={2}
           />
           <div className="flex justify-between items-center mt-2">
-            {versions.length > 0 ? (
+            <div className="flex items-center gap-2">
+              {versions.length > 0 && (
+                <button
+                  onClick={() => {
+                    setVersions([]);
+                    setSelectedVersionId(null);
+                    clear();
+                  }}
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Clear
+                </button>
+              )}
               <button
-                onClick={() => {
-                  setVersions([]);
-                  setSelectedVersionId(null);
-                  clear();
-                }}
-                className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                onClick={() =>
+                  setGenerationMode(generationMode === "json" ? "wasm" : "json")
+                }
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                  generationMode === "wasm"
+                    ? "border-green-500/50 bg-green-500/10 text-green-600 dark:text-green-400"
+                    : "border-border text-muted-foreground hover:text-foreground"
+                }`}
+                title={
+                  generationMode === "wasm" ? "WASM bytecode mode" : "JSON mode"
+                }
               >
-                Clear
+                {generationMode === "wasm" ? "wasm" : "json"}
               </button>
-            ) : (
-              <div />
-            )}
+            </div>
             {isStreaming ? (
               <button
                 onClick={() => clear()}
